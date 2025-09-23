@@ -1,0 +1,10 @@
+# 文件整理配置
+source_dir: "/Users/zesty/Desktop/file organizer v1/test"      # 要处理的源文件夹路径
+target_dir: "/Users/zesty/Desktop/file organizer v1/test_output"   # 整理后的文件存放路径
+file_extensions:                  # 需要处理的文件后缀列表
+  - ".txt"
+  - ".jpg"
+  - ".JPG"
+  - ".png"
+  - ".pdf"
+folder_date_format: "YYMMDD" # 文件夹日期格式，可选值: YYYY-MM-DD, YYYYMMDD, YY-MM-DD, YYMMDD
