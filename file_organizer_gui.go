@@ -218,10 +218,8 @@ func (fo *FileOrganizer) createGUI() {
 	fo.loadUserConfig()
 	fo.Window.Resize(fyne.NewSize(880, 590))
 
-	// 创建UI组件 - 使用Entry作为源文件夹输入框
+	// 创建源文件夹输入框
 	fo.SourceDirEntry = widget.NewLabel("")
-	//fo.SourceDirEntry.PlaceHolder = "请选择源文件夹"
-	//fo.SourceDirEntry.Disable() // 设置为只读
 
 	// 初始化RuleSelect组件（在使用前创建）
 	rules := []string{string(RuleByDate), string(RuleByExtension)}
