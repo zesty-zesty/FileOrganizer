@@ -20,14 +20,14 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// Config 配置结构体，对应YAML文件
+// Config 配置结构体
 type Config struct {
-	SourceDir        string   `yaml:"source_dir"`
-	TargetDir        string   `yaml:"target_dir"`
-	FileExtensions   []string `yaml:"file_extensions"`
-	FolderDateFormat string   `yaml:"folder_date_format"`
-	OrganizeRule     string   `yaml:"organize_rule"`
-	ExtensionCase    string   `yaml:"extension_case"` // "uppercase" 或 "lowercase"
+	SourceDir        string
+	TargetDir        string
+	FileExtensions   []string
+	FolderDateFormat string
+	OrganizeRule     string
+	ExtensionCase    string // "uppercase" 或 "lowercase"
 }
 
 // OrganizeRule 组织规则类型
@@ -59,7 +59,6 @@ type FileOrganizer struct {
 	Window              fyne.Window
 
 	// 额外的UI组件
-	scanFilesBtn           *widget.Button
 	selectExtensionsBtn    *widget.Button
 	selectDateFormatBtn    *widget.Button
 	selectExtensionCaseBtn *widget.Button
@@ -408,11 +407,12 @@ func (fo *FileOrganizer) scanFiles() {
 
 			// 根据选择的规则显示相应的选项
 			rule := OrganizeRule(fo.RuleSelect.Selected)
-			if rule == RuleByDate {
+			switch rule {
+			case RuleByDate:
 				fo.selectExtensionsBtn.Enable()
 				fo.selectDateFormatBtn.Enable()
 				fo.selectExtensionCaseBtn.Disable()
-			} else if rule == RuleByExtension {
+			case RuleByExtension:
 				fo.selectExtensionsBtn.Enable()
 				fo.selectDateFormatBtn.Disable()
 				fo.selectExtensionCaseBtn.Enable()
@@ -594,7 +594,7 @@ func (fo *FileOrganizer) moveFile(sourcePath, targetDir string) error {
 	targetPath := filepath.Join(targetDir, fileName)
 
 	// 检查目标文件是否已存在
-	if _, err := os.Stat(targetPath); err == nil {
+	if _, statErr := os.Stat(targetPath); statErr == nil {
 		ext := filepath.Ext(fileName)
 		name := fileName[:len(fileName)-len(ext)]
 		timestamp := time.Now().Format("20060102_150405") // 更精确的时间戳避免冲突
