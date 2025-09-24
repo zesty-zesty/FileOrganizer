@@ -216,7 +216,7 @@ func (fo *FileOrganizer) createGUI() {
 	fo.Window = myApp.NewWindow("文件整理工具")
 	// 现在应用已经创建，可以加载用户配置了
 	fo.loadUserConfig()
-	fo.Window.Resize(fyne.NewSize(880, 650))
+	fo.Window.Resize(fyne.NewSize(880, 590))
 
 	// 创建UI组件 - 使用Entry作为源文件夹输入框
 	fo.SourceDirEntry = widget.NewLabel("")
