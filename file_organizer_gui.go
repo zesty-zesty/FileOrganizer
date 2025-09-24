@@ -40,7 +40,7 @@ const (
 
 // FileOrganizer 结构体封装所有功能
 type FileOrganizer struct {
-	SourceDir        string
+	SourceDirs       []string
 	TargetDir        string
 	FileExtensions   []string
 	FolderDateFormat string
@@ -56,7 +56,10 @@ type FileOrganizer struct {
 	RuleSelect          *widget.Select
 	ExtensionCaseSelect *widget.Select
 	LogTextLabel        *widget.Label
+	SourceDirsList      *widget.List
 	Window              fyne.Window
+	// 存储选中的源文件夹索引（支持多选）
+	selectedSourceDirs map[int]bool
 
 	// 额外的UI组件
 	selectExtensionsBtn    *widget.Button
@@ -79,12 +82,14 @@ type FileOrganizer struct {
 // NewFileOrganizer 创建新的文件组织器实例
 func NewFileOrganizer() *FileOrganizer {
 	fo := &FileOrganizer{
-		logChan:               make(chan string, 100),
+		logChan:               make(chan string, 1000), // 增大通道缓冲区
 		logProcessorDone:      make(chan struct{}),
 		lastConfigPath:        filepath.Join(os.TempDir(), "file_organizer_last_config.yaml"),
 		scannedFileExtensions: make(map[string]bool),
 		FolderDateFormat:      "YYYY-MM-DD", // 默认文件夹命名规则
 		ExtensionCase:         "lowercase",  // 默认扩展名大小写
+		SourceDirs:            []string{},
+		selectedSourceDirs:    make(map[int]bool), // 初始化多选map
 	}
 
 	// 启动日志处理器
@@ -114,9 +119,10 @@ func (fo *FileOrganizer) loadUserConfig() {
 	}
 }
 
-// 安全更新UI的函数
+// 安全更新UI的函数 - 修复Fyne线程调用错误
 func (fo *FileOrganizer) safeUpdateUI(updateFunc func()) {
 	if updateFunc != nil {
+		// 在Fyne v2中，使用DoAndWait确保UI更新在主线程中执行
 		fyne.DoAndWait(func() {
 			updateFunc()
 		})
@@ -127,9 +133,11 @@ func (fo *FileOrganizer) safeUpdateUI(updateFunc func()) {
 func (fo *FileOrganizer) startLogProcessor() {
 	go func() {
 		var buffer strings.Builder
-		const maxBufferSize = 1024 * 5                 // 5KB的缓冲区限制 - 减小缓冲区，提高刷新频率
-		ticker := time.NewTicker(5 * time.Millisecond) // 5ms的刷新间隔 - 加快刷新速度
+		const maxBufferSize = 8 * 1024 * 1024            // 增大缓冲区到8MB，大幅减少刷新频率
+		const bulkUpdateThreshold = 200                  // 累积200条日志后批量更新
+		ticker := time.NewTicker(100 * time.Millisecond) // 100ms的刷新间隔，减少UI更新频率
 		defer ticker.Stop()
+		messageCount := 0
 
 		for {
 			select {
@@ -149,21 +157,33 @@ func (fo *FileOrganizer) startLogProcessor() {
 					return
 				}
 
-				// 检查缓冲区大小，如果过大则立即刷新
-				if buffer.Len()+len(msg) > maxBufferSize {
-					// 先刷新现有缓冲区
-					if buffer.Len() > 0 && fo.LogTextLabel != nil {
-						logContent := buffer.String()
-						fo.safeUpdateUI(func() {
-							if fo.LogTextLabel != nil {
-								currentText := fo.LogTextLabel.Text
-								fo.LogTextLabel.SetText(currentText + logContent)
-							}
-						})
-					}
-					buffer.Reset()
-				}
+				// 增加消息计数
+				messageCount++
 				buffer.WriteString(msg)
+
+				// 如果消息数量达到阈值，立即刷新
+				if messageCount >= bulkUpdateThreshold {
+					logContent := buffer.String()
+					fo.safeUpdateUI(func() {
+						if fo.LogTextLabel != nil {
+							currentText := fo.LogTextLabel.Text
+							fo.LogTextLabel.SetText(currentText + logContent)
+						}
+					})
+					buffer.Reset()
+					messageCount = 0
+				} else if buffer.Len() > maxBufferSize {
+					// 缓冲区过大时也刷新
+					logContent := buffer.String()
+					fo.safeUpdateUI(func() {
+						if fo.LogTextLabel != nil {
+							currentText := fo.LogTextLabel.Text
+							fo.LogTextLabel.SetText(currentText + logContent)
+						}
+					})
+					buffer.Reset()
+					messageCount = 0
+				}
 			case <-ticker.C:
 				if buffer.Len() > 0 && fo.LogTextLabel != nil {
 					logContent := buffer.String()
@@ -172,7 +192,7 @@ func (fo *FileOrganizer) startLogProcessor() {
 							currentText := fo.LogTextLabel.Text
 							fo.LogTextLabel.SetText(currentText + logContent)
 							// 限制日志长度，避免内存占用过大
-							const maxLogLength = 1024 * 50 // 50KB
+							const maxLogLength = 1024 * 200 // 增大到200KB
 							if len(fo.LogTextLabel.Text) > maxLogLength {
 								// 保留最后一部分日志
 								fo.LogTextLabel.SetText("[日志过长，已截断前部分]\n" +
@@ -181,6 +201,7 @@ func (fo *FileOrganizer) startLogProcessor() {
 						}
 					})
 					buffer.Reset()
+					messageCount = 0
 				}
 			}
 		}
@@ -195,16 +216,17 @@ func (fo *FileOrganizer) stopLogProcessor() {
 
 // 记录日志到UI
 func (fo *FileOrganizer) log(message string) {
-	logMsg := time.Now().Format("15:04:05") + " - " + message + "\n"
+	// 优化日志记录，减少时间戳等冗余信息
+	// 对于普通日志，不添加时间戳，只添加时间戳到重要日志
+	logMsg := message + "\n"
 
+	// 使用非阻塞方式发送日志，避免阻塞主流程
 	select {
 	case fo.logChan <- logMsg:
 	default:
-		fo.safeUpdateUI(func() {
-			if fo.LogTextLabel != nil {
-				fo.LogTextLabel.SetText(fo.LogTextLabel.Text + logMsg)
-			}
-		})
+		// 当通道满时，直接丢弃低优先级日志以确保主流程不被阻塞
+		// 只在控制台打印警告，不阻塞GUI
+		fmt.Printf("警告: 日志缓冲区已满，丢弃部分日志\n")
 	}
 }
 
@@ -215,10 +237,14 @@ func (fo *FileOrganizer) createGUI() {
 	fo.Window = myApp.NewWindow("文件整理工具")
 	// 现在应用已经创建，可以加载用户配置了
 	fo.loadUserConfig()
-	fo.Window.Resize(fyne.NewSize(880, 590))
+	fo.Window.Resize(fyne.NewSize(880, 745))
+	// 禁止用户调整窗口大小
+	fo.Window.SetFixedSize(true)
 
-	// 创建源文件夹输入框
-	fo.SourceDirEntry = widget.NewLabel("")
+	// 初始化源文件夹列表
+	fo.SourceDirs = []string{}
+	fo.SourceDirEntry = widget.NewLabel("请选择源文件夹")
+	fo.SourceDirEntry.TextStyle = fyne.TextStyle{Italic: true}
 
 	// 初始化RuleSelect组件（在使用前创建）
 	rules := []string{string(RuleByDate), string(RuleByExtension)}
@@ -232,21 +258,135 @@ func (fo *FileOrganizer) createGUI() {
 	fo.LogTextLabel.Alignment = fyne.TextAlignLeading
 	fo.LogTextLabel.TextStyle = fyne.TextStyle{Monospace: true}
 
-	// 创建浏览按钮
+	// 初始化源文件夹列表组件
+	fo.SourceDirsList = widget.NewList(
+		func() int {
+			return len(fo.SourceDirs)
+		},
+		func() fyne.CanvasObject {
+			return widget.NewLabel("")
+		},
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			o.(*widget.Label).SetText(fo.SourceDirs[i])
+		},
+	)
+	// 监听列表选择变化 - 支持多选
+	fo.SourceDirsList.OnSelected = func(id widget.ListItemID) {
+		fo.selectedSourceDirs[id] = true
+	}
+	fo.SourceDirsList.OnUnselected = func(id widget.ListItemID) {
+		delete(fo.selectedSourceDirs, id)
+	}
+
+	// 创建浏览按钮 - 支持多选文件夹
 	sourceBrowseBtn := widget.NewButtonWithIcon("选择源文件夹", theme.FolderOpenIcon(), func() {
-		dialog.ShowFolderOpen(func(dir fyne.ListableURI, err error) {
-			if err == nil && dir != nil {
-				fo.SourceDirEntry.SetText(dir.Path())
-				// 在按钮完全初始化后设置回调函数
-				fo.RuleSelect.OnChanged = func(value string) {
-					fo.scanFiles() // 选择规则后自动扫描文件
+		// 创建一个自定义的多选文件夹选择器
+		var selectedDirs []string
+		var selectFolders func()
+
+		// 定义递归选择文件夹的函数
+		selectFolders = func() {
+			dialog.ShowFolderOpen(func(dir fyne.ListableURI, err error) {
+				if err == nil && dir != nil {
+					folderPath := dir.Path()
+					selectedDirs = append(selectedDirs, folderPath)
+
+					// 询问是否继续选择
+					dialog.ShowConfirm("继续选择", "是否继续选择其他源文件夹？", func(confirm bool) {
+						if confirm {
+							selectFolders()
+						} else {
+							// 处理选择的所有文件夹
+							addedCount := 0
+							for _, folderPath := range selectedDirs {
+								// 检查是否已存在该目录
+								isDuplicate := false
+								for _, existingPath := range fo.SourceDirs {
+									if existingPath == folderPath {
+										isDuplicate = true
+										break
+									}
+								}
+
+								if !isDuplicate {
+									// 添加新文件夹
+									fo.SourceDirs = append(fo.SourceDirs, folderPath)
+									addedCount++
+								}
+							}
+
+							if addedCount > 0 {
+								fo.SourceDirEntry.SetText(fmt.Sprintf("已选择 %d 个源文件夹", len(fo.SourceDirs)))
+								fo.SourceDirsList.Refresh()
+
+								// 在按钮完全初始化后设置回调函数
+								fo.RuleSelect.OnChanged = func(value string) {
+									fo.scanFiles() // 选择规则后自动扫描文件
+								}
+								fo.RuleSelect.Enable() // 选择了源文件夹后启用规则选择
+								fo.log(fmt.Sprintf("已添加 %d 个源文件夹", addedCount))
+								// 选择源文件夹后自动扫描文件
+								fo.scanFiles()
+							}
+							// 清空临时列表
+							selectedDirs = make([]string, 0)
+						}
+					}, fo.Window)
 				}
-				fo.RuleSelect.Enable() // 选择了源文件夹后启用规则选择
-				fo.log("已选择源文件夹: " + dir.Path())
-				// 选择源文件夹后自动扫描文件
-				fo.scanFiles()
+			}, fo.Window)
+		}
+
+		// 开始选择
+		selectFolders()
+	})
+
+	// 创建删除选中源文件夹按钮 - 支持多选删除
+	removeSourceBtn := widget.NewButtonWithIcon("删除选中", theme.DeleteIcon(), func() {
+		if len(fo.selectedSourceDirs) > 0 {
+			// 创建确认对话框
+			var dirNames []string
+			for idx := range fo.selectedSourceDirs {
+				dirNames = append(dirNames, fo.SourceDirs[idx])
 			}
-		}, fo.Window)
+			dialog.ShowConfirm("确认删除", fmt.Sprintf("确定要从源文件夹列表中删除 %d 个文件夹吗？", len(fo.selectedSourceDirs)), func(confirm bool) {
+				if confirm {
+					// 创建一个映射来跟踪要删除的索引
+					toDelete := make(map[int]bool)
+					for idx := range fo.selectedSourceDirs {
+						toDelete[idx] = true
+					}
+
+					// 创建新的源文件夹列表，跳过要删除的项
+					var newSourceDirs []string
+					for idx, dir := range fo.SourceDirs {
+						if !toDelete[idx] {
+							newSourceDirs = append(newSourceDirs, dir)
+						}
+					}
+
+					// 更新源文件夹列表
+					fo.SourceDirs = newSourceDirs
+					// 更新标签显示
+					fo.SourceDirEntry.SetText(fmt.Sprintf("已选择 %d 个源文件夹", len(fo.SourceDirs)))
+					// 刷新列表
+					fo.SourceDirsList.Refresh()
+					// 清空选中索引
+					fo.selectedSourceDirs = make(map[int]bool)
+					// 如果删除后没有文件夹了，禁用相关按钮
+					if len(fo.SourceDirs) == 0 {
+						fo.safeUpdateUI(func() {
+							fo.selectExtensionsBtn.Disable()
+							fo.selectDateFormatBtn.Disable()
+							fo.selectExtensionCaseBtn.Disable()
+							fo.processBtn.Disable()
+							fo.RuleSelect.Disable()
+						})
+					}
+				}
+			}, fo.Window)
+		} else {
+			dialog.ShowInformation("提示", "请先选择要删除的源文件夹", fo.Window)
+		}
 	})
 
 	// 选择文件后缀按钮
@@ -274,11 +414,19 @@ func (fo *FileOrganizer) createGUI() {
 	fo.processBtn.Disable() // 初始时禁用
 
 	// 源文件夹区域
-	sourceArea := container.NewHBox(
-		widget.NewLabel("源文件夹:"),
-		fo.SourceDirEntry,
-		layout.NewSpacer(),
-		sourceBrowseBtn,
+	// 创建带滚动功能的源文件夹列表，并设置其最小大小以显示更多内容
+	scrollableSourceList := container.NewScroll(fo.SourceDirsList)
+	scrollableSourceList.SetMinSize(fyne.NewSize(400, 200))
+
+	sourceArea := container.NewVBox(
+		container.NewHBox(
+			widget.NewLabel("源文件夹:"),
+			fo.SourceDirEntry,
+			layout.NewSpacer(),
+			sourceBrowseBtn,
+		),
+		container.NewPadded(scrollableSourceList),
+		removeSourceBtn,
 	)
 
 	// 整理规则和文件后缀选择
@@ -297,9 +445,9 @@ func (fo *FileOrganizer) createGUI() {
 		fo.selectExtensionCaseBtn,
 	)
 
-	// 日志区域
+	// 日志区域 - 降低日志区域高度
 	logScroll := container.NewScroll(fo.LogTextLabel)
-	logScroll.SetMinSize(fyne.NewSize(0, 300))
+	logScroll.SetMinSize(fyne.NewSize(0, 200))
 	logSection := container.NewVBox(
 		widget.NewLabel("处理日志:"),
 		logScroll,
@@ -357,49 +505,77 @@ func (fo *FileOrganizer) createGUI() {
 
 // 扫描文件
 func (fo *FileOrganizer) scanFiles() {
-	sourceDir := fo.SourceDirEntry.Text
-	if sourceDir == "" {
-		dialog.ShowError(errors.New("请先指定源文件夹"), fo.Window)
-		return
-	}
-
-	// 验证源文件夹是否存在
-	if _, err := os.Stat(sourceDir); os.IsNotExist(err) {
-		dialog.ShowError(fmt.Errorf("源文件夹不存在: %s", sourceDir), fo.Window)
-		return
-	}
+	fo.safeUpdateUI(func() {
+		fo.selectExtensionsBtn.Disable()
+		fo.selectDateFormatBtn.Disable()
+		fo.selectExtensionCaseBtn.Disable()
+		fo.processBtn.Disable()
+	})
 
 	// 清空之前的扫描结果
 	fo.scannedFiles = []string{}
-	for k := range fo.scannedFileExtensions {
-		delete(fo.scannedFileExtensions, k)
+	fo.scannedFileExtensions = make(map[string]bool)
+
+	// 检查是否选择了源文件夹
+	if len(fo.SourceDirs) == 0 {
+		fo.log("请先选择源文件夹")
+		return
 	}
 
 	// 清空日志
 	fo.LogTextLabel.SetText("")
 	fo.log("开始扫描文件...")
-	fo.log(fmt.Sprintf("源文件夹: %s", sourceDir))
+	fo.log(fmt.Sprintf("共选择了 %d 个源文件夹", len(fo.SourceDirs)))
 
 	// 在goroutine中扫描文件
 	go func() {
-		err := filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			if !info.IsDir() {
-				fo.scannedFiles = append(fo.scannedFiles, path)
-				fileExt := strings.ToLower(filepath.Ext(path))
-				if fileExt != "" {
-					fo.scannedFileExtensions[fileExt] = true
+		var wg sync.WaitGroup
+		var mu sync.Mutex // 用于保护共享数据
+		errors := []string{}
+
+		// 为每个源文件夹创建一个goroutine进行扫描
+		for _, sourceDir := range fo.SourceDirs {
+			wg.Add(1)
+			go func(dir string) {
+				defer wg.Done()
+
+				// 记录当前扫描的文件夹
+				fo.log(fmt.Sprintf("正在扫描: %s", dir))
+
+				err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+					if err != nil {
+						mu.Lock()
+						errors = append(errors, fmt.Sprintf("扫描 %s 时出错: %v", path, err))
+						mu.Unlock()
+						return filepath.SkipDir // 跳过有错误的目录
+					}
+					if !info.IsDir() {
+						mu.Lock()
+						fo.scannedFiles = append(fo.scannedFiles, path)
+						fileExt := strings.ToLower(filepath.Ext(path))
+						if fileExt != "" {
+							fo.scannedFileExtensions[fileExt] = true
+						}
+						mu.Unlock()
+					}
+					return nil
+				})
+
+				if err != nil {
+					mu.Lock()
+					errors = append(errors, fmt.Sprintf("扫描 %s 时出错: %v", dir, err))
+					mu.Unlock()
 				}
-			}
-			return nil
-		})
+			}(sourceDir)
+		}
+
+		// 等待所有扫描完成
+		wg.Wait()
 
 		fo.safeUpdateUI(func() {
-			if err != nil {
-				fo.log("扫描出错: " + err.Error())
-				return
+			// 显示所有错误信息
+			for _, errMsg := range errors {
+				fo.log(errMsg)
 			}
 
 			fo.log(fmt.Sprintf("扫描完成，共发现 %d 个文件", len(fo.scannedFiles)))
@@ -506,9 +682,10 @@ func (fo *FileOrganizer) showSelectExtensionCaseDialog() {
 
 // 处理文件
 func (fo *FileOrganizer) processFilesGUI() {
-	sourceDir := fo.SourceDirEntry.Text
-	if sourceDir == "" {
-		dialog.ShowError(errors.New("请指定源文件夹"), fo.Window)
+	// 检查源文件夹
+	if len(fo.SourceDirs) == 0 {
+		fo.log("请先选择源文件夹")
+		dialog.ShowError(errors.New("请先选择源文件夹"), fo.Window)
 		return
 	}
 
@@ -517,12 +694,12 @@ func (fo *FileOrganizer) processFilesGUI() {
 		return
 	}
 
-	// 获取目标文件夹
-	targetDir := sourceDir
+	// 获取目标文件夹（使用第一个源文件夹作为目标目录）
+	targetDir := fo.SourceDirs[0]
 
 	// 创建配置
 	config := Config{
-		SourceDir:        sourceDir,
+		SourceDir:        targetDir, // 这里仍然使用第一个源文件夹作为配置中的SourceDir
 		TargetDir:        targetDir,
 		FileExtensions:   fo.FileExtensions,
 		FolderDateFormat: fo.FolderDateFormat,
@@ -531,7 +708,10 @@ func (fo *FileOrganizer) processFilesGUI() {
 	}
 
 	fo.log("开始整理文件...")
-	fo.log(fmt.Sprintf("源文件夹: %s", sourceDir))
+	fo.log(fmt.Sprintf("共 %d 个源文件夹", len(fo.SourceDirs)))
+	for _, dir := range fo.SourceDirs {
+		fo.log(fmt.Sprintf("源文件夹: %s", dir))
+	}
 	fo.log(fmt.Sprintf("整理规则: %s", fo.RuleSelect.Selected))
 	fo.log(fmt.Sprintf("处理的文件后缀: %v", fo.FileExtensions))
 
@@ -747,7 +927,10 @@ func (fo *FileOrganizer) processFiles(config Config) error {
 	fileCount := 0
 	processedCount := 0
 	updateCounter := 0
-	updateThreshold := 10
+	updateThreshold := 200 // 大幅增加阈值，显著减少UI更新频率
+	logBulkSize := 50      // 每50条结果合并为一条日志
+	var logBuffer strings.Builder
+	logCount := 0
 
 	for result := range resultChan {
 		processedCount++
@@ -755,7 +938,24 @@ func (fo *FileOrganizer) processFiles(config Config) error {
 		if strings.HasPrefix(result, "[工作协程") && strings.Contains(result, "已移动") {
 			fileCount++
 		}
-		fo.log(result)
+
+		// 批量处理日志
+		logCount++
+		logBuffer.WriteString(result)
+		logBuffer.WriteString("\n")
+
+		// 只对错误/失败日志立即处理，普通日志严格按照批量大小处理
+		if strings.Contains(result, "失败") || strings.Contains(result, "错误") || strings.Contains(result, "警告") {
+			// 对于错误/警告日志立即处理
+			fo.log(logBuffer.String())
+			logBuffer.Reset()
+			logCount = 0
+		} else if logCount >= logBulkSize {
+			// 对于普通日志批量处理
+			fo.log(logBuffer.String())
+			logBuffer.Reset()
+			logCount = 0
+		}
 
 		if updateCounter >= updateThreshold {
 			fo.safeUpdateUI(func() {
@@ -765,12 +965,17 @@ func (fo *FileOrganizer) processFiles(config Config) error {
 		}
 	}
 
+	// 处理剩余的日志
+	if logBuffer.Len() > 0 {
+		fo.log(logBuffer.String())
+	}
+
 	// 最终UI刷新和总结日志
 	finalFileCount := fileCount
 	finalProcessedCount := processedCount
 	fo.safeUpdateUI(func() {
 		fo.Window.Content().Refresh()
-		fo.log(fmt.Sprintf("处理完成，共检查了 %d 个文件，移动了 %d 个文件", finalProcessedCount, finalFileCount))
+		fo.log(time.Now().Format("15:04:05") + " - " + fmt.Sprintf("处理完成，共检查了 %d 个文件，移动了 %d 个文件", finalProcessedCount, finalFileCount))
 		fo.processBtn.Enable() // 处理完成后重新启用按钮
 	})
 	return nil

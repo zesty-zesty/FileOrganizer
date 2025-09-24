@@ -3,7 +3,7 @@
 # 构建macOS应用程序脚本 - 使用标准Go工具链
 
 # 版本号
-VERSION="v1.1.1"
+VERSION="v1.2.0"
 
 # 应用名称
 APP_NAME="FileOrganizer"
